@@ -1851,6 +1851,15 @@ body::before {
 #msgs-area { flex:1; overflow-y:auto; scroll-behavior:smooth; position:relative; z-index:1; }
 
 </style>
+
+<!-- Google GenAI SDK — Native Live Voice -->
+<script type="module">
+  import { GoogleGenAI, Modality } from 'https://esm.run/@google/genai';
+  window.GoogleGenAI = GoogleGenAI;
+  window.LiveModality = Modality;
+  window._genaiSDKReady = true;
+  console.log('[IRIS] GoogleGenAI SDK loaded ✓');
+</script>
 </head>
 <body>
 
@@ -6398,234 +6407,185 @@ function stopPollinationsLive() {
   showToast('🔴 Voice mode band hua', 'info');
 }
 
+/* ══════════════════════════════════════════════════
+   GOOGLE NATIVE VOICE — @google/genai SDK approach
+   Model: gemini-2.5-flash-native-audio-preview-09-2025
+   (Same as Naman AI — highest quality native audio)
+══════════════════════════════════════════════════ */
+
 async function startLiveMic(isReconnect = false) {
   const apiKey = APP.settings.apiKey;
-  // No API key → Pollinations voice
   if (!apiKey) { startPollinationsLive(); return; }
-  if (!isReconnect) _liveReconnectCount = 0;
   if (APP.live.recording) return;
 
+  // SDK ready check — module loads async, wait briefly
+  if (!window.GoogleGenAI) {
+    showToast('🔄 SDK load ho raha hai, 1 second ruko...', 'info');
+    await new Promise(r => setTimeout(r, 1200));
+    if (!window.GoogleGenAI) {
+      showToast('⚠️ SDK load nahi hua — reload karke try karo', 'error');
+      return;
+    }
+  }
+
   try {
-    APP.live.recording = true;
-    APP.live.sources   = new Set();
+    APP.live.recording    = true;
+    APP.live.sources      = new Set();
     _liveInputTranscript  = '';
     _liveOutputTranscript = '';
     setLiveState('listening');
 
-    // Output AudioContext (24 kHz — AI ki awaaz)
+    // ── Output AudioContext — 24 kHz (AI ki awaaz) ──
     APP.live.audioCtx   = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
     APP.live.outputNode = APP.live.audioCtx.createGain();
     APP.live.outputNode.connect(APP.live.audioCtx.destination);
     APP.live.nextStartTime = 0;
     try { await APP.live.audioCtx.resume(); } catch(e) {}
 
-    // Mic stream
+    // ── Mic stream — 16 kHz (user ki awaaz) ──
     const stream = await navigator.mediaDevices.getUserMedia({ audio: {
       echoCancellation: true, noiseSuppression: true,
       autoGainControl: true, sampleRate: 16000, channelCount: 1
     }});
     APP.live.stream = stream;
 
-    // Input AudioContext (16 kHz — mic ke liye)
     const inputCtx  = new AudioContext({ sampleRate: 16000 });
     APP.live.inputCtx = inputCtx;
-    const source    = inputCtx.createMediaStreamSource(stream);
-    const processor = inputCtx.createScriptProcessor(512, 1, 1);
+    const source     = inputCtx.createMediaStreamSource(stream);
+    const processor  = inputCtx.createScriptProcessor(2048, 1, 1);
 
     const botName  = APP.settings.botName || 'I.R.I.S ATLAS';
-    const sysInstr = APP.settings.sysInstruction || `You are ${botName}, an intelligent AI voice assistant. Keep replies concise and natural for voice conversation.`;
+    const sysInstr = APP.settings.sysInstruction ||
+      `You are ${botName}, an intelligent AI voice assistant. Keep replies concise and natural for voice conversation.`;
 
-    // ── Debounced auto-reconnect ──
-    let _closeTimer = null;
-    const _debouncedClose = () => {
-      if (_closeTimer) return;
-      _closeTimer = setTimeout(() => {
-        _closeTimer = null;
-        if (!APP.live.recording) return;
-        if (_liveReconnectCount < LIVE_MAX_RECONNECT) {
-          _liveReconnectCount++;
-          showToast(`🔄 Reconnecting... (${_liveReconnectCount}/${LIVE_MAX_RECONNECT})`, 'info');
-          stopLiveMic();
-          setTimeout(() => startLiveMic(true), 800);
-        } else {
-          _liveReconnectCount = 0;
-          showToast('Voice connection band ho gayi — "Start" dobara dabao', 'warning');
-          stopLiveMic();
-        }
-      }, 2500);
-    };
+    // ── Google GenAI SDK connect ──
+    const ai = new window.GoogleGenAI({ apiKey });
+    const Modality = window.LiveModality || { AUDIO: 'AUDIO' };
 
-    // ── Direct WebSocket — koi SDK nahi chahiye ──
-    // Model list: stable pehle, preview baad mein
-    const _liveModels = [
-      'gemini-2.5-flash-preview-native-audio-dialog',
-      'gemini-2.0-flash-live-001',
-      'gemini-2.5-flash-exp-native-audio-thinking-dialog',
-      'gemini-2.0-flash-exp',
-    ];
-    // Model index track karo — 1008 pe next try hoga
-    if (!isReconnect) window._liveModelIdx = 0;
-    const modelIdx  = Math.min(window._liveModelIdx || 0, _liveModels.length - 1);
-    const modelName = _liveModels[modelIdx];
+    const sessionPromise = ai.live.connect({
+      model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+      callbacks: {
+        onopen: () => {
+          console.log('[Live] GoogleGenAI SDK connected ✓');
+          _liveInputTranscript  = '';
+          _liveOutputTranscript = '';
+          setLiveState('listening');
+          const tr = document.getElementById('live-transcript');
+          if (tr) { tr.style.fontStyle = 'italic'; tr.style.color = 'rgba(255,255,255,.4)'; tr.textContent = 'Bol sakte ho... 🎤'; }
 
-    // v1alpha — Live API sirf yahan available hai (v1beta pe nahi)
-    const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
-    const ws = new WebSocket(wsUrl);
-    APP.live.ws = ws;
+          // Mic processor shuru karo
+          source.connect(processor);
+          processor.connect(inputCtx.destination);
+          try { inputCtx.resume(); } catch(e) {}
 
-    ws.onopen = () => {
-      // Pehla message hamesha setup hona chahiye
-      ws.send(JSON.stringify({
-        setup: {
-          model: `models/${modelName}`,
-          generation_config: {
-            response_modalities: ['AUDIO'],
-            speech_config: {
-              voice_config: { prebuilt_voice_config: { voice_name: 'Zephyr' } },
-              language_code: callLang || 'hi-IN'
-            }
-          },
-          system_instruction: { parts: [{ text: sysInstr }] },
-          realtime_input_config: { automatic_activity_detection: {} },
-          input_audio_transcription:  {},
-          output_audio_transcription: {}
-        }
-      }));
-    };
-
-    ws.onmessage = async (event) => {
-      let msg;
-      try {
-        const raw = (event.data instanceof Blob) ? await event.data.text() : event.data;
-        msg = JSON.parse(raw);
-      } catch(e) { return; }
-
-      // ── Setup complete: ab audio pipeline shuru karo ──
-      if (msg.setupComplete !== undefined) {
-        if (_closeTimer) { clearTimeout(_closeTimer); _closeTimer = null; }
-        _liveInputTranscript  = '';
-        _liveOutputTranscript = '';
-        setLiveState('listening');
-        const tr = document.getElementById('live-transcript');
-        if (tr) { tr.style.fontStyle = 'italic'; tr.style.color = 'rgba(255,255,255,.4)'; tr.textContent = 'Bol sakte ho... 🎤'; }
-        _liveReconnectCount = 0;
-        console.log('[Live] WebSocket connected, model:', modelName);
-
-        // Mic processor connect karo
-        source.connect(processor);
-        processor.connect(inputCtx.destination);
-        try { inputCtx.resume(); } catch(e) {}
-
-        processor.onaudioprocess = (e) => {
-          if (!APP.live.recording || ws.readyState !== WebSocket.OPEN) return;
-          const blob = _liveCreateBlob(e.inputBuffer.getChannelData(0));
-          try { ws.send(JSON.stringify({ realtime_input: { media_chunks: [blob] } })); } catch(err) {}
-        };
-
-        // AudioContext keepalive
-        APP.live.ctxKeepAlive = setInterval(async () => {
-          if (!APP.live.recording) return;
-          if (APP.live.audioCtx?.state === 'suspended') try { await APP.live.audioCtx.resume(); } catch(e) {}
-          if (inputCtx.state === 'suspended') try { await inputCtx.resume(); } catch(e) {}
-        }, 5000);
-
-        showToast('🎙️ Connected — Bol sakte ho!', 'success');
-        return;
-      }
-
-      // ── AI audio playback ──
-      const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-      if (audioData) {
-        setLiveState('processing');
-        if (APP.live.audioCtx?.state === 'suspended') try { await APP.live.audioCtx.resume(); } catch(e) {}
-        _liveDecodeAudio(_liveDecode(audioData), APP.live.audioCtx, 24000, 1).then(buf => {
-          if (!APP.live.audioCtx) return;
-          const src = APP.live.audioCtx.createBufferSource();
-          src.buffer = buf;
-          src.connect(APP.live.outputNode);
-          APP.live.nextStartTime = Math.max(APP.live.nextStartTime, APP.live.audioCtx.currentTime);
-          src.start(APP.live.nextStartTime);
-          APP.live.nextStartTime += buf.duration;
-          APP.live.sources.add(src);
-          src.onended = () => {
-            APP.live.sources.delete(src);
-            if (APP.live.sources.size === 0 && APP.live.recording) setLiveState('listening');
+          processor.onaudioprocess = (ev) => {
+            if (!APP.live.recording) return;
+            const blob = _liveCreateBlob(ev.inputBuffer.getChannelData(0));
+            sessionPromise.then(s => {
+              try { s.sendRealtimeInput({ media: blob }); } catch(e) {}
+            });
           };
-        }).catch(() => {});
-      }
 
-      // ── User speech transcript ──
-      if (msg.serverContent?.inputTranscription?.text) {
-        _liveInputTranscript += msg.serverContent.inputTranscription.text;
-        _liveOutputTranscript = '';
-        const tr = document.getElementById('live-transcript');
-        if (tr) { tr.style.fontStyle = 'normal'; tr.style.color = 'rgba(255,255,255,.85)'; tr.textContent = '🎤 ' + _liveInputTranscript; }
-      }
+          // AudioContext keepalive
+          APP.live.ctxKeepAlive = setInterval(async () => {
+            if (!APP.live.recording) return;
+            if (APP.live.audioCtx?.state === 'suspended') try { await APP.live.audioCtx.resume(); } catch(e) {}
+            if (inputCtx.state === 'suspended') try { await inputCtx.resume(); } catch(e) {}
+          }, 5000);
 
-      // ── AI speech transcript ──
-      if (msg.serverContent?.outputTranscription?.text) {
-        _liveOutputTranscript += msg.serverContent.outputTranscription.text;
-        const tr = document.getElementById('live-transcript');
-        if (tr) { tr.style.fontStyle = 'normal'; tr.style.color = 'var(--cyan)'; tr.textContent = '🤖 ' + _liveOutputTranscript; }
-      }
+          showToast('🎙️ Connected — Bol sakte ho!', 'success');
+        },
 
-      // ── Turn complete ──
-      if (msg.serverContent?.turnComplete) {
-        if (_liveInputTranscript || _liveOutputTranscript) {
-          pushLiveTurnToChat(_liveInputTranscript, _liveOutputTranscript);
+        onmessage: async (message) => {
+          // ── AI Audio playback ──
+          const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+          if (audioData) {
+            setLiveState('processing');
+            if (APP.live.audioCtx?.state === 'suspended') try { await APP.live.audioCtx.resume(); } catch(e) {}
+            _liveDecodeAudio(_liveDecode(audioData), APP.live.audioCtx, 24000, 1).then(buf => {
+              if (!APP.live.audioCtx) return;
+              const src = APP.live.audioCtx.createBufferSource();
+              src.buffer = buf;
+              src.connect(APP.live.outputNode);
+              APP.live.nextStartTime = Math.max(APP.live.nextStartTime, APP.live.audioCtx.currentTime);
+              src.start(APP.live.nextStartTime);
+              APP.live.nextStartTime += buf.duration;
+              APP.live.sources.add(src);
+              src.onended = () => {
+                APP.live.sources.delete(src);
+                if (APP.live.sources.size === 0 && APP.live.recording) setLiveState('listening');
+              };
+            }).catch(() => {});
+          }
+
+          // ── User speech transcript ──
+          if (message.serverContent?.inputTranscription?.text) {
+            _liveInputTranscript += message.serverContent.inputTranscription.text;
+            _liveOutputTranscript = '';
+            const tr = document.getElementById('live-transcript');
+            if (tr) { tr.style.fontStyle = 'normal'; tr.style.color = 'rgba(255,255,255,.85)'; tr.textContent = '🎤 ' + _liveInputTranscript; }
+          }
+
+          // ── AI speech transcript ──
+          if (message.serverContent?.outputTranscription?.text) {
+            _liveOutputTranscript += message.serverContent.outputTranscription.text;
+            const tr = document.getElementById('live-transcript');
+            if (tr) { tr.style.fontStyle = 'normal'; tr.style.color = 'var(--cyan)'; tr.textContent = '🤖 ' + _liveOutputTranscript; }
+          }
+
+          // ── Turn complete ──
+          if (message.serverContent?.turnComplete) {
+            if (_liveInputTranscript || _liveOutputTranscript) {
+              pushLiveTurnToChat(_liveInputTranscript, _liveOutputTranscript);
+            }
+            _liveInputTranscript  = '';
+            _liveOutputTranscript = '';
+            if (APP.live.recording) setLiveState('listening');
+          }
+
+          // ── Interrupted ──
+          if (message.serverContent?.interrupted) {
+            for (const s of APP.live.sources) { try { s.stop(); } catch(e) {} }
+            APP.live.sources.clear();
+            APP.live.nextStartTime = APP.live.audioCtx ? APP.live.audioCtx.currentTime : 0;
+            _liveInputTranscript  = '';
+            _liveOutputTranscript = '';
+            if (APP.live.recording) setLiveState('listening');
+          }
+        },
+
+        onclose: () => {
+          console.log('[Live] Session closed');
+          if (APP.live.recording) stopLiveMic();
+        },
+
+        onerror: (e) => {
+          console.error('[Live] Session error:', e);
+          if (APP.live.recording) stopLiveMic();
         }
-        _liveInputTranscript  = '';
-        _liveOutputTranscript = '';
-        if (APP.live.recording) setLiveState('listening');
+      },
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+          languageCode: callLang || 'hi-IN'
+        },
+        inputAudioTranscription:  {},
+        outputAudioTranscription: {},
+        systemInstruction: sysInstr
       }
+    });
 
-      // ── Interrupted: audio clear karo ──
-      if (msg.serverContent?.interrupted) {
-        for (const s of APP.live.sources) { try { s.stop(); } catch(e) {} }
-        APP.live.sources.clear();
-        APP.live.nextStartTime = APP.live.audioCtx ? APP.live.audioCtx.currentTime : 0;
-        _liveInputTranscript  = '';
-        _liveOutputTranscript = '';
-        if (APP.live.recording) setLiveState('listening');
-      }
-    };
-
-    ws.onclose = (e) => {
-      console.log('[Live] WebSocket closed:', e.code, e.reason);
-      // 1008 = model not found / policy violation → next model try karo
-      if (e.code === 1008 && APP.live.recording) {
-        const nextIdx = modelIdx + 1;
-        if (nextIdx < _liveModels.length) {
-          window._liveModelIdx = nextIdx;
-          // Silent retry — user ko dikhao nahi
-          console.log('[Live] Retrying with model:', _liveModels[nextIdx]);
-          stopLiveMic();
-          setTimeout(() => startLiveMic(true), 600);
-        } else {
-          // Sabhi models try ho gaye → Pollinations pe fallback
-          window._liveModelIdx = 0;
-          showToast('🔄 Gemini Live unavailable — Pollinations Voice chal raha hai', 'info');
-          stopLiveMic();
-          setTimeout(() => startPollinationsLive(), 500);
-        }
-        return;
-      }
-      if (APP.live.recording) _debouncedClose();
-    };
-
-    ws.onerror = (e) => {
-      console.error('[Live] WebSocket error:', e);
-      _debouncedClose();
-    };
+    APP.live.session = await sessionPromise;
 
   } catch(err) {
-    console.error('Live Mode Error:', err);
+    console.error('[Live] Error:', err);
     APP.live.recording = false;
     const msg = err.message || String(err);
-    const hint = msg.includes('Permission') || msg.includes('NotAllowed') || msg.includes('mic')
+    const hint = msg.includes('Permission') || msg.includes('NotAllowed')
       ? 'Mic permission do browser ko'
-      : msg.includes('403') || msg.includes('key')
-        ? 'Invalid API key — Profile mein check karo'
+      : msg.includes('403') || msg.includes('key') || msg.includes('API_KEY')
+        ? 'Invalid API key — Settings mein check karo'
         : msg.slice(0, 80);
     showToast('🎙️ Voice error: ' + hint, 'error');
     stopLiveMic();
@@ -6642,10 +6602,10 @@ function stopLiveMic() {
   APP.live.sources.clear();
   APP.live.nextStartTime = 0;
 
-  // WebSocket band karo (new direct approach)
-  if (APP.live.ws) { try { APP.live.ws.close(); } catch(e) {} APP.live.ws = null; }
-  // Legacy session close (backward compat)
+  // SDK session close
   if (APP.live.session) { try { APP.live.session.close(); } catch(e) {} APP.live.session = null; }
+  // Legacy WebSocket close (backward compat)
+  if (APP.live.ws)      { try { APP.live.ws.close(); }      catch(e) {} APP.live.ws      = null; }
 
   if (APP.live.audioCtx) { try { APP.live.audioCtx.close(); } catch(e) {} APP.live.audioCtx = null; }
   if (APP.live.inputCtx) { try { APP.live.inputCtx.close(); } catch(e) {} APP.live.inputCtx = null; }
@@ -6655,6 +6615,7 @@ function stopLiveMic() {
 
   setLiveState('standby');
 }
+
 
 /* ─── NOTES ─── */
 function openNotes() {
